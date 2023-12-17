@@ -1,21 +1,121 @@
 "use client";
 
-import { useEffect, useRef, useState, ReactElement } from "react";
+import { useEffect, useRef, useState, ReactElement, forwardRef } from "react";
 import { socket } from "../../../lib/socket";
 import { usePathname } from "next/navigation";
 
 type UserProps = {
   id: string;
   muted?: boolean;
+  isHost: boolean;
 };
 
-const User = ({ id, muted = false }: UserProps) => {
-  return (
-    <div key={id}>
-      <video ref={ref} playsInline autoPlay={true} muted={muted}></video>
-    </div>
-  );
-};
+let stream: MediaStream;
+const RemoteUser = forwardRef(
+  ({ id, isHost, muted = true }: UserProps, ref) => {
+    const _socket = ref;
+    const remoteRef = useRef(null);
+    const [isInit, setIsInit] = useState(false);
+
+    useEffect(() => {
+      let peer;
+      const initStream = async () => {
+        if (isInit) return;
+        if (typeof window !== "undefined") {
+          peer = createPeerConnection();
+          stream.getTracks().forEach((track) => peer.addTrack(track, stream));
+
+          peer.addEventListener("track", gotRemoteStream);
+          peer.onicecandidate = onIceCandidateEvent;
+        }
+
+        const localPeerOffer = await peer.createOffer();
+        await peer.setLocalDescription(
+          new RTCSessionDescription(localPeerOffer),
+        );
+
+        _socket.emit("mediaOffer", {
+          offer: localPeerOffer,
+          from: _socket.id,
+          to: id,
+        });
+
+        setIsInit(true);
+
+        _socket.on("mediaOffer", onMediaOffer);
+        _socket.on("mediaAnswer", onMediaAnswer);
+        _socket.on("remotePeerIceCandidate", onRemotePeerIceCandidate);
+      };
+
+      const onMediaOffer = async (data) => {
+        if (data.from === id) {
+          await peer.setRemoteDescription(
+            new RTCSessionDescription(data.offer),
+          );
+          const peerAnswer = await peer.createAnswer();
+          await peer.setLocalDescription(new RTCSessionDescription(peerAnswer));
+
+          _socket.emit("mediaAnswer", {
+            answer: peerAnswer,
+            from: _socket.id,
+            to: data.from,
+          });
+        }
+      };
+
+      const onMediaAnswer = async (data) => {
+        if (data.from === id) {
+          await peer.setRemoteDescription(
+            new RTCSessionDescription(data.answer),
+          );
+        }
+      };
+
+      const onIceCandidateEvent = (event) => {
+        if (event.candidate) {
+          _socket.emit("iceCandidate", {
+            to: id,
+            candidate: event.candidate,
+          });
+        }
+      };
+
+      const gotRemoteStream = (event) => {
+        console.log("gotRemoteStream + ", id);
+        const [remoteStream] = event.streams;
+        if (remoteRef.current) {
+          remoteRef.current.srcObject = remoteStream;
+        }
+      };
+
+      const onRemotePeerIceCandidate = async (data) => {
+        if (data.from === id) {
+          const candidate = new RTCIceCandidate(data.candidate);
+          await peer.addIceCandidate(candidate);
+        }
+      };
+
+      initStream();
+
+      return () => {
+        _socket.off("mediaOffer", onMediaOffer);
+        _socket.off("mediaAnswer", onMediaAnswer);
+        _socket.off("remotePeerIceCandidate", onRemotePeerIceCandidate);
+      };
+    }, []);
+
+    return (
+      <div key={id}>
+        <video
+          ref={remoteRef}
+          playsInline
+          autoPlay={true}
+          muted={muted}
+        ></video>
+      </div>
+    );
+  },
+);
 
 const createPeerConnection = () => {
   return new RTCPeerConnection({
@@ -28,24 +128,18 @@ const createPeerConnection = () => {
 };
 
 export default function Page(): JSX.Element {
+  const socketRef = useRef(null);
   const pathname = usePathname();
   const room = pathname.split("/room/")[1];
   const videoRef = useRef<ReactElement<HTMLVideoElement>>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [connectedUsers, setConnectedUsers] = useState<string[]>([]);
-  const [peerConnection, setPeerConnection] =
-    useState<RTCPeerConnection | null>(null);
-  const [currentRoom, setCurrentRoom] = useState<any>(null);
+  const [isHost, setIsHost] = useState<boolean>(true);
 
   useEffect(() => {
-    let _socket = socket();
-    let peer: RTCPeerConnection;
-
-    async function onConnect() {
-      setIsConnected(true);
-      _socket.emit("enterRoom", { room });
-
-      const stream = await navigator.mediaDevices.getUserMedia({
+    socketRef.current = socket();
+    const initMedia = async () => {
+      stream = await navigator.mediaDevices.getUserMedia({
         video: true,
         audio: true,
       });
@@ -55,125 +149,50 @@ export default function Page(): JSX.Element {
         videoRef.current.play();
       }
 
-      if (typeof window !== "undefined") {
-        peer = createPeerConnection();
-        stream.getTracks().forEach((track) => peer.addTrack(track, stream));
-        setPeerConnection(peer);
-      }
+      setIsConnected(true);
+    };
+
+    async function onConnect() {
+      setIsConnected(true);
+      await initMedia();
+      socketRef.current.emit("enterRoom", { room });
     }
 
     function onDisconnect() {
       setIsConnected(false);
     }
 
-    function onUpdateUserList(payload) {
-      console.log("Received users");
-      setConnectedUsers(payload.connectedUsers);
-    }
-
     async function onRoomDetails(payload) {
-      console.log("onRoomDetails called");
-      console.log({ payload, id: _socket.id });
-      if (!payload.users) {
-        const localPeerOffer = await peer.createOffer();
-        await peer.setLocalDescription(
-          new RTCSessionDescription(localPeerOffer),
-        );
+      const users = payload.room.users.filter(
+        (id) => id !== socketRef.current.id,
+      );
 
-        _socket.emit("mediaOffer", {
-          room,
-          offer: localPeerOffer,
-          owner: _socket.id,
-        });
+      if (payload.room.host !== socketRef.current.id) {
+        setIsHost(false);
+      }
+
+      if (users.length > 0) {
+        setConnectedUsers([...users]);
         return;
       }
-
-      try {
-        await peer.setRemoteDescription(
-          new RTCSessionDescription(payload.offer),
-        );
-        const peerAnswer = await peer.createAnswer();
-        await peer.setLocalDescription(new RTCSessionDescription(peerAnswer));
-
-        _socket.emit("mediaAnswer", {
-          answer: peerAnswer,
-          from: _socket.id,
-          to: payload.owner,
-        });
-      } catch (error) {
-        console.log({ error });
-      }
-      // setCurrentRoom(payload.room);
     }
 
-    async function onMediaOffer(data) {
-      try {
-        await peer.setRemoteDescription(new RTCSessionDescription(data.offer));
-        const peerAnswer = await peer.createAnswer();
-        await peer.setLocalDescription(new RTCSessionDescription(peerAnswer));
-
-        _socket.emit("mediaAnswer", {
-          answer: peerAnswer,
-          from: _socket.id,
-          to: data.from,
-        });
-      } catch (error) {
-        // Handle error
-      }
-    }
-
-    async function onMediaAnswer(data) {
-      try {
-        await peer.setRemoteDescription(new RTCSessionDescription(data.offer));
-        const peerAnswer = await peer.createAnswer();
-        await peer.setLocalDescription(new RTCSessionDescription(peerAnswer));
-
-        _socket.emit("mediaAnswer", {
-          answer: peerAnswer,
-          from: _socket.id,
-          to: data.from,
-        });
-      } catch (error) {
-        // Handle error
-      }
-    }
-
-    function onRoomCreated(payload) {
-      console.log({ payloadCreated: payload });
-    }
-
-    async function onRemotePeerIceCandidate(data) {
-      try {
-        const candidate = new RTCIceCandidate(data.candidate);
-        await peer.addIceCandidate(candidate);
-      } catch (error) {
-        // Handle error
-      }
-    }
-
-    _socket.on("connect", onConnect);
-    _socket.on("disconnect", onDisconnect);
-    _socket.on("updateUserList", onUpdateUserList);
-    _socket.on("roomDetails", onRoomDetails);
-    _socket.on("roomCreated", onRoomCreated);
-    _socket.on("remotePeerIceCandidate", onRemotePeerIceCandidate);
+    socketRef.current.on("connect", onConnect);
+    socketRef.current.on("disconnect", onDisconnect);
+    socketRef.current.on("roomDetails", onRoomDetails);
 
     return () => {
-      _socket.off("connect", onConnect);
-      _socket.off("disconnect", onDisconnect);
-      _socket.off("updateUserList", onUpdateUserList);
-      _socket.off("roomDetails", onRoomDetails);
-      _socket.off("roomCreated", onRoomCreated);
-      _socket.off("mediaOffer", onMediaOffer);
-      _socket.off("mediaAnswer", onMediaAnswer);
-      _socket.off("remotePeerIceCandidate", onRemotePeerIceCandidate);
-      if (peerConnection) {
-        peerConnection.close();
-      }
-      _socket.disconnect();
+      socketRef.current.off("connect", onConnect);
+      socketRef.current.off("disconnect", onDisconnect);
+      socketRef.current.off("roomDetails", onRoomDetails);
+      socketRef.current.disconnect();
       setIsConnected(false);
     };
   }, []);
+
+  if (!isConnected) return null;
+
+  console.log({ isHost, connectedUsers });
 
   return (
     <main className="flex flex-col h-full">
@@ -188,11 +207,21 @@ export default function Page(): JSX.Element {
       >
         <div>
           <video
+            className="[transform:rotateY(180deg)]"
             ref={videoRef}
             playsInline
             autoPlay={true}
             muted={true}
           ></video>
+
+          {connectedUsers.map((id) => (
+            <RemoteUser
+              ref={socketRef.current}
+              isHost={isHost}
+              key={id}
+              id={id}
+            />
+          ))}
         </div>
       </section>
     </main>

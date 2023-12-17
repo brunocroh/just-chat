@@ -4,6 +4,7 @@ type Room = {
   id: string;
   peer: null;
   users: string[];
+  host: string;
 };
 
 type ServerToClientEvents = {
@@ -17,13 +18,36 @@ type ServerToClientEvents = {
 type ClientToServerEvents = {
   updateUserList: (props: { connectedUsers: string[] }) => void;
   roomDetails: (props: { room: Room }) => void;
+  enterRoom: (props: { room: Room }) => void;
   roomCreated: (props: { room: Room }) => void;
   mediaOffer: (props: { from: string; offer: any }) => void;
   mediaAnswer: (props: { from: string; answer: any }) => void;
-  remotePeerIceCandidate: (props: { candidate: any }) => void;
+  remotePeerIceCandidate: (props: { candidate: any; from: string }) => void;
 };
 
-const rooms = new Map();
+const connectedUsers = new Map<string, string>();
+const rooms = new Map<string, Room>();
+
+const disconectUser = (userId: string) => {
+  const roomId = connectedUsers.get(userId);
+  if (!roomId) {
+    console.warn(`The user ${userId} is not related to any room `);
+    return;
+  }
+
+  const room = rooms.get(roomId);
+
+  if (!room) {
+    console.warn(`The room ${roomId} does not exist `);
+    return;
+  }
+
+  room.users = room.users.filter((id) => id !== userId);
+  rooms.set(room.id, room);
+  connectedUsers.delete(userId);
+
+  io.to(roomId).emit("roomDetails", { room });
+};
 
 const io = new Server<ServerToClientEvents, ClientToServerEvents>({
   cors: {
@@ -31,33 +55,25 @@ const io = new Server<ServerToClientEvents, ClientToServerEvents>({
   },
 });
 
-let connectedUsers: string[] = [];
-
 io.on("connection", (socket) => {
   console.log("A user connected");
 
-  connectedUsers.push(socket.id);
-
-  socket.emit("updateUserList", { connectedUsers });
-  socket.broadcast.emit("updateUserList", { connectedUsers });
-
   socket.on("disconnect", () => {
-    console.log("A user disconnected");
-    connectedUsers = connectedUsers.filter((user) => user !== socket.id);
-
-    socket.broadcast.emit("updateUserList", { connectedUsers });
+    disconectUser(socket.id);
   });
 
   socket.on("enterRoom", ({ room: roomName }) => {
     socket.join(roomName);
+    connectedUsers.set(socket.id, roomName);
     let room: Room = {
       id: roomName,
       peer: null,
       users: [],
+      host: socket.id,
     };
 
     if (rooms.has(roomName)) {
-      room = rooms.get(roomName);
+      room = rooms.get(roomName)!;
     }
 
     const newRoomState = {
@@ -68,9 +84,11 @@ io.on("connection", (socket) => {
     rooms.set(roomName, newRoomState);
 
     io.to(roomName).emit("roomDetails", { room: newRoomState });
+    socket.emit("enterRoom", { room: newRoomState });
   });
 
   socket.on("mediaOffer", (data) => {
+    console.log("mediaOfer");
     socket.to(data.to).emit("mediaOffer", {
       from: data.from,
       offer: data.offer,
@@ -87,6 +105,7 @@ io.on("connection", (socket) => {
   socket.on("iceCandidate", (data) => {
     socket.to(data.to).emit("remotePeerIceCandidate", {
       candidate: data.candidate,
+      from: socket.id,
     });
   });
 });
